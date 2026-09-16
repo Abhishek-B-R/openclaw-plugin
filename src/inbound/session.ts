@@ -68,12 +68,17 @@ import {
 } from "../hosted-call-tool-settlement.js";
 import { recordInboundChannelHint } from "../channel-hint.js";
 import {
+  applyOutboundContext,
   classifySendRejection,
   claimDeliveryFailure,
   clearOutboundFailures,
+  getOutboundContext,
   imessageDeliveryFailure,
   mailDeliveryFailure,
   noteOutboundDeliveryFailure,
+  popOutboundContext,
+  removeOutboundContext,
+  saveOutboundContext,
   textDeliveryFailure,
   OUTBOUND_FAILURE_MAX_ATTEMPTS,
   type DeliveryFailure,
@@ -1645,6 +1650,14 @@ async function deliverReply(
         ...(conversationId ? { conversationId } : { to: params.turn.remoteAddress }),
         text,
       });
+      saveOutboundContext({
+        messageId: msg.id,
+        channel: "imessage",
+        chatId: params.turn.contactKey,
+        recipient: params.turn.remoteAddress,
+        body: text,
+        conversationId: conversationId ?? msg.conversationId,
+      });
       return msg.id;
     } catch (error) {
       throw new OutboundSendRejection("imessage", error);
@@ -1661,6 +1674,14 @@ async function deliverReply(
       const msg = await identity.sendText({
         ...(conversationId ? { conversationId } : { to: params.turn.remoteAddress }),
         text,
+      });
+      saveOutboundContext({
+        messageId: msg.id,
+        channel: "sms",
+        chatId: params.turn.contactKey,
+        recipient: params.turn.remoteAddress,
+        body: text,
+        conversationId,
       });
       return msg.id;
     } catch (error) {
@@ -1683,6 +1704,16 @@ async function deliverReply(
       subject,
       bodyText: text,
       inReplyToMessageId: params.turn.replyToId,
+    });
+    saveOutboundContext({
+      messageId: msg.id,
+      channel: "email",
+      chatId: params.turn.contactKey,
+      recipient: params.turn.remoteAddress,
+      body: text,
+      emailThreadId: params.turn.threadId?.replace(/^email:/, ""),
+      emailRfcMessageId: params.turn.replyToId,
+      emailSubject: subject,
     });
     return msg.id;
   } catch (error) {
@@ -4366,8 +4397,13 @@ async function handleDeliveryFailure(
     opts.logger?.info?.("Inkbox delivery-failure webhook ignored (no message payload).");
     return;
   }
-  // Only outbound sends fail; an inbound-direction lifecycle row is not ours.
-  if (failure.direction && failure.direction.toLowerCase() === "inbound") {
+  // Only outbound sends fail; an inbound-direction lifecycle row is not ours
+  // unless its message id matches a send we recorded.
+  if (
+    failure.direction &&
+    failure.direction.toLowerCase() === "inbound" &&
+    !getOutboundContext(failure.messageId)
+  ) {
     return;
   }
   // Async webhook replays are deduped per failed message; synchronous send
@@ -4387,8 +4423,14 @@ async function handleDeliveryFailure(
       return;
     }
   }
-  const recipient = failure.recipient;
-  const conversationId = failure.conversationId;
+  // Correlate through the context recorded at send time first. A thin webhook
+  // can omit the recipient, conversation, or body; the webhook fields are the
+  // fallback. Sync rejections already carry the turn's details.
+  const ctx = failure.stage !== "send_rejected" ? popOutboundContext(failure.messageId) : undefined;
+  const resolved = ctx ? applyOutboundContext(failure, ctx) : failure;
+  const recipient = resolved.recipient;
+  const conversationId = resolved.conversationId;
+  const chatId = ctx?.chatId ?? extra?.chatId;
   const routable =
     failure.channel === "email" ? Boolean(recipient) : Boolean(conversationId || recipient);
   if (!routable) {
@@ -4403,15 +4445,15 @@ async function handleDeliveryFailure(
       ? await lookupContact(opts.runtime, failure.channel === "email" ? "email" : "phone", recipient)
       : undefined);
   const contactKey =
-    contact?.id ?? recipient ?? extra?.chatId ?? conversationId ?? `${failure.channel}:${conversationId}`;
+    contact?.id ?? recipient ?? chatId ?? conversationId ?? `${failure.channel}:${conversationId}`;
   const note = noteOutboundDeliveryFailure({
     channel: failure.channel,
     stage: failure.stage,
     conversationId,
     target: recipient,
-    chatId: extra?.chatId ?? contactKey,
+    chatId: chatId ?? contactKey,
     contactMarker: renderContactMarker(contact),
-    failedBody: failure.failedBody,
+    failedBody: resolved.failedBody,
     errorCode: failure.errorCode,
     errorDetail: failure.errorDetail,
   });
@@ -4438,10 +4480,10 @@ async function handleDeliveryFailure(
     remoteAddress: recipient,
     ...(failure.channel === "email"
       ? {
-          subject: failure.subject,
+          subject: resolved.subject,
           // Thread the retry under the message that bounced.
-          replyToId: failure.rfcMessageId,
-          threadId: failure.emailThreadId ? `email:${failure.emailThreadId}` : undefined,
+          replyToId: resolved.rfcMessageId,
+          threadId: resolved.emailThreadId ? `email:${resolved.emailThreadId}` : undefined,
         }
       : {
           conversationId,
@@ -5908,7 +5950,8 @@ export function createInkboxSessionBridge(opts: InkboxSessionBridgeOptions): Ink
         return;
       }
       if (event.event_type === "text.delivered") {
-        // A delivered receipt clears the conversation's failed-send budget.
+        // A delivered receipt clears the conversation's failed-send budget
+        // and drops the outbound context for that message id.
         const msg = event.data?.text_message;
         if (msg && (msg.direction ?? "outbound").toLowerCase() !== "inbound") {
           clearOutboundFailures(
@@ -5916,6 +5959,7 @@ export function createInkboxSessionBridge(opts: InkboxSessionBridgeOptions): Ink
             msg.conversation_id,
             msg.remote_phone_number ?? event.data?.recipient_phone_number,
           );
+          removeOutboundContext(msg.id);
         }
       }
       const turn = await buildTextTurn(opts.runtime, opts.account, event, opts.logger);
@@ -5933,10 +5977,12 @@ export function createInkboxSessionBridge(opts: InkboxSessionBridgeOptions): Ink
         return;
       }
       if (event.event_type === "imessage.delivered") {
-        // A delivered receipt clears the conversation's failed-send budget.
+        // A delivered receipt clears the conversation's failed-send budget
+        // and drops the outbound context for that message id.
         const msg = event.data?.message;
         if (msg && (msg.direction ?? "outbound").toLowerCase() !== "inbound") {
           clearOutboundFailures("imessage", msg.conversation_id, msg.remote_number);
+          removeOutboundContext(msg.id);
         }
       }
       if (event.event_type === "imessage.reaction_received") {
